@@ -1,0 +1,139 @@
+name: Optimize APK (dex -> STORED)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  optimize-apk:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    - name: Instalar dependencias
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y zip unzip jq curl openjdk-11-jdk-headless openssl
+
+    - name: Descargar la última APK del Release
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        owner_repo="manpiro12/manpiro12"
+        api_url="https://api.github.com/repos/$owner_repo/releases/latest"
+        echo "Obteniendo release desde $api_url"
+        release_json=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "$api_url")
+        asset_api_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | endswith(".apk")) | .url' | head -n1)
+        if [ -z "$asset_api_url" ] || [ "$asset_api_url" = "null" ]; then
+          echo "No se encontró ningún asset .apk en la última release."; exit 1
+        fi
+        echo "Asset API URL: $asset_api_url"
+        curl -L -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/octet-stream" "$asset_api_url" -o original.apk
+        ls -lh original.apk
+
+    - name: Extraer APK y preparar contenido
+      run: |
+        rm -rf unpack || true
+        mkdir unpack
+        unzip -q original.apk -d unpack
+        rm -rf unpack/META-INF || true
+        echo "Archivos extraídos:"
+        find unpack -maxdepth 3 -type f | sed -n '1,200p'
+
+    - name: Reempaquetar APK con .dex STORED (sin compresión)
+      run: |
+        cd unpack
+        # guardamos lista de todos los .dex (recursivo)
+        find . -type f -name "*.dex" > ../dex_list.txt || true
+        cd ..
+        # Crear zip inicial sin archivos .dex
+        zip -r ../unsigned.apk unpack -x "unpack/**/*.dex" >/dev/null
+        # Agregar cada dex sin compresión
+        while read -r dexpath; do
+          if [ -f "$dexpath" ]; then
+            zip -0 ../unsigned.apk "$dexpath" >/dev/null
+          fi
+        done < dex_list.txt || true
+        echo "unsigned.apk creado"
+        ls -lh unsigned.apk
+
+    - name: Instalar Android cmdline-tools y build-tools
+      run: |
+        export ANDROID_SDK_ROOT="$HOME/android-sdk"
+        mkdir -p $ANDROID_SDK_ROOT/cmdline-tools
+        cd $HOME
+        curl -sSf -o cmdline-tools.zip "https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip"
+        unzip -q cmdline-tools.zip -d $ANDROID_SDK_ROOT/cmdline-tools
+        mv $ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools $ANDROID_SDK_ROOT/cmdline-tools/latest || true
+        export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH"
+        yes | sdkmanager --sdk_root=$ANDROID_SDK_ROOT "platform-tools" "build-tools;33.0.2" >/dev/null
+        export PATH="$ANDROID_SDK_ROOT/build-tools/33.0.2:$PATH"
+        apksigner version || true
+
+    - name: Generar keystore temporal
+      run: |
+        KS_PASS=$(openssl rand -base64 12)
+        keytool -genkeypair -v \
+          -keystore release_keystore.jks \
+          -alias mykey \
+          -keyalg RSA -keysize 2048 \
+          -validity 10000 \
+          -storepass "$KS_PASS" -keypass "$KS_PASS" \
+          -dname "CN=manpiro12, OU=Dev, O=manpiro, L=City, S=State, C=US"
+        echo "KEYSTORE_PASS=$KS_PASS" >> $GITHUB_ENV
+        ls -lh release_keystore.jks
+
+    - name: Zipalign (si existe) y firmar con apksigner
+      env:
+        KEYSTORE_PASS: ${{ env.KEYSTORE_PASS }}
+      run: |
+        if command -v zipalign >/dev/null; then
+          zipalign -v -p 4 unsigned.apk unsigned-aligned.apk || true
+        else
+          mv unsigned.apk unsigned-aligned.apk
+        fi
+
+        if command -v apksigner >/dev/null; then
+          apksigner sign --ks release_keystore.jks --ks-pass env:KEYSTORE_PASS --key-pass env:KEYSTORE_PASS --out optimized.apk unsigned-aligned.apk
+        else
+          jarsigner -keystore release_keystore.jks -storepass "$KEYSTORE_PASS" -keypass "$KEYSTORE_PASS" unsigned-aligned.apk mykey
+          mv unsigned-aligned.apk optimized.apk
+        fi
+        ls -lh optimized.apk || true
+
+    - name: Crear release y subir APK optimizada
+      uses: actions/github-script@v6
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const fs = require('fs');
+          const tag = 'optimized-' + Date.now();
+          const name = 'APK optimizada - ' + new Date().toISOString();
+          const body = 'APK con .dex almacenados (STORED) para mejorar compatibilidad en dispositivos de baja gama (ej. Infinix Smart 8).';
+          const release = await github.rest.repos.createRelease({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            tag_name: tag,
+            name: name,
+            body: body,
+            draft: false,
+            prerelease: false
+          });
+          const release_id = release.data.id;
+          const path = 'optimized.apk';
+          const data = fs.readFileSync(path);
+          await github.rest.repos.uploadReleaseAsset({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            release_id: release_id,
+            name: path.replace(/.*\//,''),
+            data: data,
+            headers: {
+              'content-type': 'application/vnd.android.package-archive',
+              'content-length': data.length
+            }
+          });
+          console.log('Release creada con ID:', release_id);
