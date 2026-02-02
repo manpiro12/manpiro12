@@ -1,0 +1,26 @@
+# APK files
+*.apk
+
+# Keystore files
+*.jks
+*.keystore
+
+# Output directory
+output/
+
+# Unpack directory
+unpack/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
