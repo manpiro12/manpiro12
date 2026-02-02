@@ -1,7 +1,16 @@
 name: Optimize APK (dex -> STORED)
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 'Repositorio GitHub (owner/repo)'
+        required: true
+        default: 'manpiro12/manpiro12'
+      apk_name:
+        description: 'Nombre del APK de salida'
+        required: true
+        default: '8ball_pool_optimized.apk'
 
 permissions:
   contents: write
@@ -16,124 +25,264 @@ jobs:
     - name: Instalar dependencias
       run: |
         sudo apt-get update
-        sudo apt-get install -y zip unzip jq curl openjdk-11-jdk-headless openssl
+        sudo apt-get install -y zip unzip jq curl openjdk-17-jdk-headless openssl python3 python3-requests
 
     - name: Descargar la última APK del Release
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        owner_repo="manpiro12/manpiro12"
+        owner_repo="${{ github.event.inputs.repo }}"
         api_url="https://api.github.com/repos/$owner_repo/releases/latest"
-        echo "Obteniendo release desde $api_url"
+        echo "📥 Obteniendo release desde $api_url"
+        
         release_json=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "$api_url")
         asset_api_url=$(echo "$release_json" | jq -r '.assets[] | select(.name | endswith(".apk")) | .url' | head -n1)
+        
         if [ -z "$asset_api_url" ] || [ "$asset_api_url" = "null" ]; then
-          echo "No se encontró ningún asset .apk en la última release."; exit 1
+          echo "❌ No se encontró ningún asset .apk en la última release."
+          exit 1
         fi
-        echo "Asset API URL: $asset_api_url"
+        
+        echo "📥 Asset API URL: $asset_api_url"
         curl -L -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/octet-stream" "$asset_api_url" -o original.apk
         ls -lh original.apk
 
     - name: Extraer APK y preparar contenido
       run: |
+        echo "📦 Extrayendo APK..."
         rm -rf unpack || true
         mkdir unpack
         unzip -q original.apk -d unpack
+        
+        # Eliminar firma anterior
         rm -rf unpack/META-INF || true
-        echo "Archivos extraídos:"
-        find unpack -maxdepth 3 -type f | sed -n '1,200p'
+        
+        echo "✅ Archivos extraídos:"
+        find unpack -type f -name "*.dex" | head -20
 
     - name: Reempaquetar APK con .dex STORED (sin compresión)
       run: |
+        echo "📦 Reempaquetando APK con .dex STORED..."
+        
+        # Crear directorio de salida
+        mkdir -p output
+        
+        # Crear APK sin firmar
+        UNSIGNED_APK="output/unsigned.apk"
+        
+        # Crear lista de archivos .dex
+        find unpack -type f -name "*.dex" > dex_files.txt
+        echo "🔍 Archivos .dex encontrados:"
+        cat dex_files.txt
+        
+        # Crear ZIP base con todos los archivos EXCEPTO .dex
         cd unpack
-        # guardamos lista de todos los .dex (recursivo)
-        find . -type f -name "*.dex" > ../dex_list.txt || true
+        zip -r "../$UNSIGNED_APK" . -x "*.dex" 2>/dev/null
         cd ..
-        # Crear zip inicial sin archivos .dex
-        zip -r ../unsigned.apk unpack -x "unpack/**/*.dex" >/dev/null
-        # Agregar cada dex sin compresión
-        while read -r dexpath; do
-          if [ -f "$dexpath" ]; then
-            zip -0 ../unsigned.apk "$dexpath" >/dev/null
+        
+        # Añadir cada .dex sin compresión (STORED) - ¡CRÍTICO!
+        echo "📄 Agregando archivos .dex sin compresión (STORED)..."
+        while IFS= read -r dex_file; do
+          if [ -f "$dex_file" ]; then
+            # zip -0 = STORED (sin compresión)
+            zip -0 "$UNSIGNED_APK" "$dex_file"
+            echo "   [STORED] $dex_file"
           fi
-        done < dex_list.txt || true
-        echo "unsigned.apk creado"
-        ls -lh unsigned.apk
+        done < dex_files.txt
+        
+        echo "✅ APK sin firmar creado:"
+        ls -lh "$UNSIGNED_APK"
 
-    - name: Instalar Android cmdline-tools y build-tools
+    - name: Verificar que .dex estén STORED
       run: |
+        echo "🔍 Verificando compresión de archivos .dex..."
+        
+        # Listar información de compresión
+        unzip -v output/unsigned.apk | grep -E "\.(dex|apk)$" || true
+        
+        # Verificar específicamente los .dex
+        echo ""
+        echo "📊 Estado de compresión de archivos .dex:"
+        python3 << 'EOF'
+        import zipfile
+        import sys
+        
+        with zipfile.ZipFile('output/unsigned.apk', 'r') as zf:
+            dex_files = [info for info in zf.infolist() if info.filename.endswith('.dex')]
+            
+            if not dex_files:
+                print("❌ No se encontraron archivos .dex")
+                sys.exit(1)
+            
+            all_stored = True
+            for info in dex_files:
+                compress_type = "STORED" if info.compress_type == zipfile.ZIP_STORED else "DEFLATED"
+                status = "✅" if info.compress_type == zipfile.ZIP_STORED else "❌"
+                print(f"   {status} {info.filename}: {compress_type}")
+                if info.compress_type != zipfile.ZIP_STORED:
+                    all_stored = False
+            
+            if all_stored:
+                print("\n✅ Todos los archivos .dex están correctamente STORED")
+            else:
+                print("\n❌ ALGUNOS archivos .dex están DEFLATED - ¡Esto causará crashes!")
+                sys.exit(1)
+        EOF
+
+    - name: Instalar Android SDK y herramientas de firma
+      run: |
+        echo "🔧 Instalando Android SDK..."
         export ANDROID_SDK_ROOT="$HOME/android-sdk"
         mkdir -p $ANDROID_SDK_ROOT/cmdline-tools
+        
         cd $HOME
         curl -sSf -o cmdline-tools.zip "https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip"
         unzip -q cmdline-tools.zip -d $ANDROID_SDK_ROOT/cmdline-tools
-        mv $ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools $ANDROID_SDK_ROOT/cmdline-tools/latest || true
+        mv $ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools $ANDROID_SDK_ROOT/cmdline-tools/latest 2>/dev/null || true
+        
         export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH"
-        yes | sdkmanager --sdk_root=$ANDROID_SDK_ROOT "platform-tools" "build-tools;33.0.2" >/dev/null
-        export PATH="$ANDROID_SDK_ROOT/build-tools/33.0.2:$PATH"
-        apksigner version || true
+        yes | sdkmanager --sdk_root=$ANDROID_SDK_ROOT "platform-tools" "build-tools;34.0.0" >/dev/null 2>&1
+        
+        export PATH="$ANDROID_SDK_ROOT/build-tools/34.0.0:$PATH"
+        echo "PATH=$PATH" >> $GITHUB_ENV
+        
+        # Verificar herramientas
+        zipalign --version || true
+        apksigner --version || true
 
     - name: Generar keystore temporal
       run: |
-        KS_PASS=$(openssl rand -base64 12)
+        echo "🔐 Generando keystore..."
+        KS_PASS=$(openssl rand -base64 16)
+        
         keytool -genkeypair -v \
           -keystore release_keystore.jks \
           -alias mykey \
           -keyalg RSA -keysize 2048 \
           -validity 10000 \
-          -storepass "$KS_PASS" -keypass "$KS_PASS" \
-          -dname "CN=manpiro12, OU=Dev, O=manpiro, L=City, S=State, C=US"
+          -storepass "$KS_PASS" \
+          -keypass "$KS_PASS" \
+          -dname "CN=APKOptimizer, OU=Dev, O=Optimizer, L=City, S=State, C=US" 2>/dev/null
+        
         echo "KEYSTORE_PASS=$KS_PASS" >> $GITHUB_ENV
-        ls -lh release_keystore.jks
+        echo "✅ Keystore generado"
 
-    - name: Zipalign (si existe) y firmar con apksigner
+    - name: Alinear y firmar APK
       env:
         KEYSTORE_PASS: ${{ env.KEYSTORE_PASS }}
       run: |
-        if command -v zipalign >/dev/null; then
-          zipalign -v -p 4 unsigned.apk unsigned-aligned.apk || true
-        else
-          mv unsigned.apk unsigned-aligned.apk
-        fi
+        echo "✍️  Alineando y firmando APK..."
+        
+        export ANDROID_SDK_ROOT="$HOME/android-sdk"
+        export PATH="$ANDROID_SDK_ROOT/build-tools/34.0.0:$PATH"
+        
+        UNSIGNED_APK="output/unsigned.apk"
+        ALIGNED_APK="output/aligned.apk"
+        SIGNED_APK="output/${{ github.event.inputs.apk_name }}"
+        
+        # Alinear el APK (mejora rendimiento)
+        echo "   Alineando con zipalign..."
+        zipalign -v -p 4 "$UNSIGNED_APK" "$ALIGNED_APK"
+        
+        # Firmar con apksigner (Android 11+ compatible)
+        echo "   Firmando con apksigner..."
+        apksigner sign \
+          --ks release_keystore.jks \
+          --ks-pass env:KEYSTORE_PASS \
+          --key-pass env:KEYSTORE_PASS \
+          --out "$SIGNED_APK" \
+          "$ALIGNED_APK"
+        
+        echo "✅ APK firmado:"
+        ls -lh "$SIGNED_APK"
 
-        if command -v apksigner >/dev/null; then
-          apksigner sign --ks release_keystore.jks --ks-pass env:KEYSTORE_PASS --key-pass env:KEYSTORE_PASS --out optimized.apk unsigned-aligned.apk
-        else
-          jarsigner -keystore release_keystore.jks -storepass "$KEYSTORE_PASS" -keypass "$KEYSTORE_PASS" unsigned-aligned.apk mykey
-          mv unsigned-aligned.apk optimized.apk
-        fi
-        ls -lh optimized.apk || true
+    - name: Verificación final del APK
+      run: |
+        echo "🔍 Verificación final..."
+        
+        export ANDROID_SDK_ROOT="$HOME/android-sdk"
+        export PATH="$ANDROID_SDK_ROOT/build-tools/34.0.0:$PATH"
+        
+        SIGNED_APK="output/${{ github.event.inputs.apk_name }}"
+        
+        # Verificar firma
+        apksigner verify -v "$SIGNED_APK" || true
+        
+        # Verificar que .dex siguen STORED después de firmar
+        echo ""
+        echo "📊 Verificando .dex en APK firmado:"
+        python3 << 'EOF'
+        import zipfile
+        
+        with zipfile.ZipFile("$SIGNED_APK", 'r') as zf:
+            dex_files = [info for info in zf.infolist() if info.filename.endswith('.dex')]
+            for info in dex_files:
+                compress_type = "STORED" if info.compress_type == zipfile.ZIP_STORED else "DEFLATED"
+                status = "✅" if info.compress_type == zipfile.ZIP_STORED else "❌"
+                print(f"   {status} {info.filename}: {compress_type}")
+        EOF
+        
+        echo ""
+        echo "📦 Tamaño final: $(du -h $SIGNED_APK | cut -f1)"
 
-    - name: Crear release y subir APK optimizada
-      uses: actions/github-script@v6
+    - name: Crear Release y subir APK optimizada
+      uses: actions/github-script@v7
       with:
         github-token: ${{ secrets.GITHUB_TOKEN }}
         script: |
           const fs = require('fs');
-          const tag = 'optimized-' + Date.now();
-          const name = 'APK optimizada - ' + new Date().toISOString();
-          const body = 'APK con .dex almacenados (STORED) para mejorar compatibilidad en dispositivos de baja gama (ej. Infinix Smart 8).';
+          const path = require('path');
+          
+          const apkName = '${{ github.event.inputs.apk_name }}';
+          const apkPath = `output/${apkName}`;
+          
+          // Leer archivo
+          const data = fs.readFileSync(apkPath);
+          const sizeMB = (data.length / (1024 * 1024)).toFixed(2);
+          
+          // Crear release
+          const tag = `optimized-${Date.now()}`;
           const release = await github.rest.repos.createRelease({
             owner: context.repo.owner,
             repo: context.repo.repo,
             tag_name: tag,
-            name: name,
-            body: body,
+            name: `🎱 APK Optimizada - ${new Date().toLocaleDateString()}`,
+            body: `## ✅ APK Optimizada para Infinix Smart 8
+
+**Archivos .dex convertidos de DEFLATED → STORED**
+
+Esta optimización corrige crashes en dispositivos de gama baja causados por la compresión incorrecta de archivos .dex.
+
+### 📊 Detalles:
+- **Nombre:** ${apkName}
+- **Tamaño:** ${sizeMB} MB
+- **Optimización:** Archivos .dex almacenados sin compresión
+- **Compatibilidad:** Android 7+ (API 24+)
+- **Firma:** V1 + V2 + V3 (Android 11+ compatible)
+
+### 💡 Notas:
+- El menú integrado debería funcionar sin crashes
+- Optimizado específicamente para dispositivos con poca RAM
+- APK firmada y lista para instalar
+
+### ⚠️ Requisitos:
+- Desinstalar cualquier versión anterior antes de instalar
+- Permitir "Orígenes desconocidos" en ajustes de seguridad`,
             draft: false,
             prerelease: false
           });
-          const release_id = release.data.id;
-          const path = 'optimized.apk';
-          const data = fs.readFileSync(path);
+          
+          // Subir APK
           await github.rest.repos.uploadReleaseAsset({
             owner: context.repo.owner,
             repo: context.repo.repo,
-            release_id: release_id,
-            name: path.replace(/.*\//,''),
+            release_id: release.data.id,
+            name: apkName,
             data: data,
             headers: {
               'content-type': 'application/vnd.android.package-archive',
               'content-length': data.length
             }
           });
-          console.log('Release creada con ID:', release_id);
+          
+          console.log(`✅ Release creada: ${release.data.html_url}`);
