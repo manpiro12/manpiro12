@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1015252244585",
+    "project_id": "ball-boll",
+    "storage_bucket": "ball-boll.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1015252244585:android:9e035753b6ceed0b47aaf8",
+        "android_client_info": {
+          "package_name": "com.miniclip.eightballpool"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDMqWS0VD4cUDB1eEh0cDcn329yipRV1jk"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
